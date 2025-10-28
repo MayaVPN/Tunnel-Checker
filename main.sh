@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# make sure root fs is writable (some boxes boot read-only after crash)
+mount -o remount,rw /
+
 ### CONFIG ###
 TUNNEL_IPV6="2a01:4f8:1c1b:219b:b1::1"   # مقصدی که با ping6 می‌سنجیم
 ALLOWED_IP_1="38.180.44.179"            # سرور مانیتور خارج (اصلی)
@@ -25,7 +28,6 @@ if [ -f /etc/nginx/sites-enabled/default ]; then
     rm -f /etc/nginx/sites-enabled/default
 fi
 if [ -f /etc/nginx/sites-available/default ]; then
-    # نمی‌حذفیمش برای همیشه، فقط unlink کردیم بالا
     :
 fi
 
@@ -108,9 +110,7 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
-# start/reload nginx safely
 systemctl enable nginx
-# nginx may not yet be running, so start OR reload depending on state:
 if systemctl is-active --quiet nginx; then
     nginx -t && systemctl reload nginx
 else
