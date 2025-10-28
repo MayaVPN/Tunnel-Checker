@@ -1,23 +1,43 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo "[1/6] Installing prerequisites..."
-apt update
-apt install -y python3 python3-pip python3-venv nginx
+### CONFIG ###
+TUNNEL_IPV6="2a01:4f8:1c1b:219b:b1::1"   # مقصدی که با ping6 می‌سنجیم
+ALLOWED_IP_1="38.180.44.179"            # سرور مانیتور خارج (اصلی)
+ALLOWED_IP_2="38.180.62.165"            # سرور مانیتور بکاپ / دوم
+LISTEN_PORT_PUBLIC=8888                 # پورتی که nginx به بیرون اکسپوز می‌کنه
+LISTEN_PORT_LOCAL=8887                  # پورتی که Flask روی لوکال گوش می‌ده
+SERVICE_NAME="health-tunnel.service"    # اسم سرویس systemd
+PY_PATH="/opt/health-tunnel.py"         # اسکریپت پایتون
+NGINX_SITE_PATH="/etc/nginx/sites-available/health"
+NGINX_SITE_LINK="/etc/nginx/sites-enabled/health"
+########################################
 
-echo "[2/6] Removing default nginx site (avoid port 80 conflicts)..."
-rm -f /etc/nginx/sites-enabled/default || true
-rm -f /etc/nginx/sites-available/default || true
+echo "[1/7] apt update & install prereqs (python3, pip, nginx, iputils-ping)..."
+apt update -y
+apt install -y python3 python3-pip nginx iputils-ping
 
-echo "[3/6] Writing /opt/health-tunnel.py ..."
-cat >/opt/health-tunnel.py <<'EOF'
+echo "[2/7] install Flask (global is fine here)..."
+pip3 install flask
+
+echo "[3/7] disable default nginx site so it doesn't grab :80 and conflict later..."
+if [ -f /etc/nginx/sites-enabled/default ]; then
+    rm -f /etc/nginx/sites-enabled/default
+fi
+if [ -f /etc/nginx/sites-available/default ]; then
+    # نمی‌حذفیمش برای همیشه، فقط unlink کردیم بالا
+    :
+fi
+
+echo "[4/7] write Flask health server to $PY_PATH ..."
+cat > "$PY_PATH" <<EOF
 #!/usr/bin/env python3
 from flask import Flask, jsonify
 import subprocess
 
 app = Flask(__name__)
 
-TARGET_IPV6 = "2a01:4f8:1c1b:219b:b1::1"
+TARGET_IPV6 = "${TUNNEL_IPV6}"
 
 @app.route("/health")
 def health():
@@ -28,91 +48,96 @@ def health():
             stderr=subprocess.PIPE,
             text=True
         )
-
         if result.returncode == 0:
             return jsonify({"status": "ok", "message": "Tunnel is active"}), 200
         else:
             return jsonify({"status": "fail", "message": "Tunnel down"}), 503
-
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8887)
+    # dev run (not used in production because systemd runs it)
+    app.run(host="127.0.0.1", port=${LISTEN_PORT_LOCAL})
 EOF
 
-chmod +x /opt/health-tunnel.py
+chmod +x "$PY_PATH"
 
-echo "[4/6] Creating/refreshing systemd service health-tunnel.service ..."
-# If an old service existed with a different name, disable it
-if systemctl list-unit-files | grep -q "^health-server.service"; then
-    systemctl stop health-server.service || true
-    systemctl disable health-server.service || true
-    rm -f /etc/systemd/system/health-server.service || true
-fi
-
-cat >/etc/systemd/system/health-tunnel.service <<'EOF'
+echo "[5/7] create/refresh systemd service /etc/systemd/system/$SERVICE_NAME ..."
+cat > "/etc/systemd/system/$SERVICE_NAME" <<EOF
 [Unit]
 Description=IPv6 tunnel health probe for uptime monitor
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /opt/health-tunnel.py
-WorkingDirectory=/opt
+ExecStart=/usr/bin/python3 ${PY_PATH}
 Restart=always
 RestartSec=3
 User=root
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/opt
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable health-tunnel.service
-systemctl restart health-tunnel.service
-
-echo "[5/6] Writing nginx site /etc/nginx/sites-available/health ..."
-
-cat >/etc/nginx/sites-available/health <<'EOF'
+echo "[6/7] write nginx site to $NGINX_SITE_PATH ..."
+cat > "$NGINX_SITE_PATH" <<EOF
 server {
-    listen 8888;
+    listen ${LISTEN_PORT_PUBLIC};
     server_name _;
 
     location /health {
-        # Allowed callers
+        # allow only monitoring servers + localhost
         allow 127.0.0.1;
-        allow 38.180.44.179;
-        allow 38.180.62.165;
+        allow ${ALLOWED_IP_1};
+        allow ${ALLOWED_IP_2};
         deny all;
 
-        proxy_pass http://127.0.0.1:8887;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
+        proxy_pass http://127.0.0.1:${LISTEN_PORT_LOCAL}/health;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
     }
 }
 EOF
 
-ln -sf /etc/nginx/sites-available/health /etc/nginx/sites-enabled/health
+ln -sf "$NGINX_SITE_PATH" "$NGINX_SITE_LINK"
 
-echo "[6/6] Reloading nginx ..."
-nginx -t
-systemctl reload nginx
+echo "[7/7] reload services (systemd + nginx)..."
+systemctl daemon-reload
+systemctl enable "$SERVICE_NAME"
+systemctl restart "$SERVICE_NAME"
 
-echo
-echo "=== Status checks ==="
-echo
-echo "[*] systemd service:"
-systemctl --no-pager --full status health-tunnel.service || true
-
-echo
-echo "[*] Listening sockets:"
-ss -tlnp | grep -E '8887|8888' || true
-
-echo
-echo "[*] Local curl test:"
-curl -s -v http://127.0.0.1:8888/health || true
+# start/reload nginx safely
+systemctl enable nginx
+# nginx may not yet be running, so start OR reload depending on state:
+if systemctl is-active --quiet nginx; then
+    nginx -t && systemctl reload nginx
+else
+    systemctl start nginx
+fi
 
 echo
-echo "DONE ✅"
-echo "If you see status \"ok\" or \"fail\" above (NOT 403), you're good."
-echo "Now you can add this monitor in your dashboard as http://YOUR_SERVER_IP:8888/health"
+echo "=== POST-CHECKS ==="
+echo "1) Service status:"
+systemctl status "$SERVICE_NAME" --no-pager || true
+echo
+echo "2) Listening sockets:"
+ss -tlnp | grep -E "${LISTEN_PORT_LOCAL}|${LISTEN_PORT_PUBLIC}" || true
+echo
+echo "3) Local curl tests:"
+curl -v "http://127.0.0.1:${LISTEN_PORT_LOCAL}/health" || true
+curl -v "http://127.0.0.1:${LISTEN_PORT_PUBLIC}/health" || true
+echo
+echo "Setup complete ✅"
+echo "From central server, monitor this URL:"
+echo "  http://<THIS_SERVER_PUBLIC_IP>:${LISTEN_PORT_PUBLIC}/health"
+echo
+echo "In your uptime panel:"
+echo "  Type: http"
+echo "  Target: http://<THIS_SERVER_PUBLIC_IP>:${LISTEN_PORT_PUBLIC}/health"
+echo '  Keyword: status":"ok'
+echo "  Timeout: 5000ms (or higher if link is slow)"
+echo "  Agent: central"
+echo
+echo "Done 🎉"
