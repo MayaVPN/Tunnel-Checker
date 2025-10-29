@@ -8,6 +8,7 @@ mount -o remount,rw /
 TUNNEL_IPV6="2a01:4f8:1c1b:219b:b1::1"   # مقصدی که با ping6 می‌سنجیم
 ALLOWED_IP_1="38.180.44.179"            # سرور مانیتور خارج (اصلی)
 ALLOWED_IP_2="38.180.62.165"            # سرور مانیتور بکاپ / دوم
+ALLOWED_IP_3="188.245.176.55"            # سرور مانیتور بکاپ / سوم
 LISTEN_PORT_PUBLIC=8888                 # پورتی که nginx به بیرون اکسپوز می‌کنه
 LISTEN_PORT_LOCAL=8887                  # پورتی که Flask روی لوکال گوش می‌ده
 SERVICE_NAME="health-tunnel.service"    # اسم سرویس systemd
@@ -94,6 +95,7 @@ server {
         allow 127.0.0.1;
         allow ${ALLOWED_IP_1};
         allow ${ALLOWED_IP_2};
+        allow ${ALLOWED_IP_3};
         deny all;
 
         proxy_pass http://127.0.0.1:${LISTEN_PORT_LOCAL}/health;
